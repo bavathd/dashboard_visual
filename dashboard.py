@@ -496,13 +496,6 @@ def page_overview(reg_df: pd.DataFrame, scores_long: pd.DataFrame):
     k5.metric("Avg age (yrs)", f"{avg_age:.1f}" if pd.notna(avg_age) else "—")
     k6.metric("Unique schools", df["schoolName"].nunique() if "schoolName" in df else 0)
 
-    if not scores_long.empty:
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Participants assessed", scores_long["vpd_id"].nunique())
-        a2.metric("Total assessment sessions", scores_long.groupby(["vpd_id", "date"]).ngroups)
-        avg_acc = scores_long["correct"].fillna(False).astype(int).mean()
-        a3.metric("Cohort mean accuracy", f"{avg_acc:.0%}" if pd.notna(avg_acc) else "—")
-
     st.markdown("---")
 
     # ---------------------------------------------------------------- #
@@ -854,25 +847,25 @@ def render_score_card(vpd_id: str, scores_for_date: dict[str, dict]):
         t = len(idxs) * LEVELS_PER_DOMAIN
         time_ms = sub["Total Time (ms)"].sum()
         group_rows.append({
-            "Group": group,
-            "Correct": int(c),
+            "Domain": group,
+            "Correct responses": int(c),
             "Total": int(t),
             "Accuracy": c / t,
             "Total Time (ms)": int(time_ms),
         })
     grand = {
-        "Group": "Visual Perception Total",
-        "Correct": int(sum(r["Correct"] for r in group_rows)),
+        "Domain": "Visual Perception Total",
+        "Correct responses": int(sum(r["Correct responses"] for r in group_rows)),
         "Total": int(sum(r["Total"] for r in group_rows)),
         "Total Time (ms)": int(sum(r["Total Time (ms)"] for r in group_rows)),
     }
-    grand["Accuracy"] = grand["Correct"] / grand["Total"] if grand["Total"] else 0
+    grand["Accuracy"] = grand["Correct responses"] / grand["Total"] if grand["Total"] else 0
     group_rows.append(grand)
     group_df = pd.DataFrame(group_rows)
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        st.subheader("Per-domain scores")
+        st.subheader("Graphical representation of accuracy scores")
         fig = px.bar(
             df, x="Domain", y="Accuracy",
             text=df["Accuracy"].map(lambda v: f"{v:.0%}"),
@@ -883,26 +876,16 @@ def render_score_card(vpd_id: str, scores_for_date: dict[str, dict]):
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        st.subheader("Skill group totals")
+        st.subheader("Domain scores")
         st.dataframe(
             group_df.assign(Accuracy=group_df["Accuracy"].map(lambda v: f"{v:.1%}")),
             use_container_width=True, hide_index=True,
         )
 
-    st.subheader("Domain detail")
+    st.subheader("Item based scores")
     st.dataframe(
         df.drop(columns=["_correct"]).assign(Accuracy=df["Accuracy"].map(lambda v: f"{v:.0%}")),
         use_container_width=True, hide_index=True,
-    )
-
-    # CSV export of the score card
-    export = df.drop(columns=["_correct"])
-    csv = export.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        f"⬇️ Score card CSV ({vpd_id})",
-        data=csv,
-        file_name=f"{vpd_id}_scorecard.csv",
-        mime="text/csv",
     )
 
 
