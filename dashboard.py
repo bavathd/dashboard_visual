@@ -68,6 +68,11 @@ DOMAIN_GROUPS: dict[str, list[int]] = {
 
 LEVELS_PER_DOMAIN = 10
 
+# Minimum gap between two Firestore syncs triggered from the restricted
+# ("My data") view, so a non-admin can't hammer Firestore reads by mashing
+# the refresh button.
+SYNC_COOLDOWN_SECONDS = 60
+
 # Local data cache (JSON files persisted to disk, loaded on every page render)
 DATA_DIR = Path(__file__).parent / "data_cache"
 DATA_DIR.mkdir(exist_ok=True)
@@ -524,14 +529,17 @@ def compute_grouped_totals(domain_summary: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 
+def _default_credentials_path() -> str:
+    """Where the Admin SDK service account key lives on this server, if at all."""
+    return os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
+
+
 def sidebar_credentials() -> firestore.Client | None:
     # Auto-collapse the connection panel if local cache already exists,
     # since the user only needs it for syncing.
     has_cache = META_FILE.exists()
     with st.sidebar.expander("🔐 Firebase connection", expanded=not has_cache):
-        default_path = os.environ.get(
-            "GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json"
-        )
+        default_path = _default_credentials_path()
         has_local = os.path.exists(default_path)
 
         mode = st.radio(
@@ -1155,17 +1163,23 @@ def page_analytics(scores_long: pd.DataFrame):
 # --------------------------------------------------------------------------- #
 
 
-def _format_relative_time(iso_str: str) -> str:
-    """'2 minutes ago', '3 hours ago', etc."""
+def _seconds_since(iso_str: str) -> float | None:
+    """Seconds elapsed since an ISO timestamp, or None if unparsable."""
     try:
         ts = datetime.fromisoformat(iso_str)
     except (ValueError, TypeError):
-        return "unknown"
-    now = datetime.now(timezone.utc)
+        return None
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    delta = now - ts
-    secs = int(delta.total_seconds())
+    return (datetime.now(timezone.utc) - ts).total_seconds()
+
+
+def _format_relative_time(iso_str: str) -> str:
+    """'2 minutes ago', '3 hours ago', etc."""
+    raw_secs = _seconds_since(iso_str)
+    if raw_secs is None:
+        return "unknown"
+    secs = int(raw_secs)
     if secs < 60:
         return f"{secs}s ago"
     if secs < 3600:
@@ -1254,8 +1268,57 @@ def admin_dashboard():
         page_analytics(scores_long)
 
 
+def render_refresh_button() -> None:
+    """
+    Sidebar control letting a non-admin pull the latest data from Firestore.
+
+    Uses the server's own Admin SDK credentials (never asks the viewer for
+    one) so a restricted user can only trigger a sync, never widen their
+    access. Rate-limited via SYNC_COOLDOWN_SECONDS to avoid abuse of
+    Firestore read quota.
+    """
+    st.sidebar.markdown("### 💾 Data")
+    meta = get_sync_metadata()
+    if meta:
+        st.sidebar.caption(f"**Last synced:** {_format_relative_time(meta.get('synced_at', ''))}")
+    else:
+        st.sidebar.caption("No data synced yet.")
+
+    creds_path = _default_credentials_path()
+    has_creds = os.path.exists(creds_path)
+
+    seconds_since_sync = _seconds_since(meta.get("synced_at", "")) if meta else None
+    on_cooldown = seconds_since_sync is not None and seconds_since_sync < SYNC_COOLDOWN_SECONDS
+
+    if not has_creds:
+        help_text = "Server isn't connected to Firestore yet — ask an admin to sync."
+    elif on_cooldown and seconds_since_sync is not None:
+        help_text = f"Just synced — try again in {int(SYNC_COOLDOWN_SECONDS - seconds_since_sync)}s."
+    else:
+        help_text = "Fetch the latest data from Firestore."
+
+    if st.sidebar.button(
+        "🔄 Refresh my data",
+        disabled=not has_creds or on_cooldown,
+        use_container_width=True,
+        help=help_text,
+    ):
+        db = get_db("file", creds_path)
+        if db is None:
+            st.sidebar.error("Could not connect to Firestore.")
+        else:
+            with st.spinner("Refreshing…"):
+                sync_from_firestore(db)
+            st.cache_data.clear()
+            st.rerun()
+
+    st.sidebar.markdown("---")
+
+
 def restricted_dashboard(allowed_ids: list[str]):
     """Scoped view for a logged-in participant/parent email: only their own data."""
+    render_refresh_button()
+
     reg_mtime = get_file_mtime(REGISTRATIONS_FILE)
     scores_mtime = get_file_mtime(SCORES_FILE)
 
