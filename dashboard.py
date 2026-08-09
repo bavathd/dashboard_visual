@@ -21,11 +21,8 @@ Auth (dashboard login):
     Access level per email:
       - Emails listed in the `ADMIN_EMAILS` secret/env var (comma-separated)
         get the full, unrestricted dashboard (all participants + sync UI).
-      - Every other email must have a doc in the Firestore `users` collection
-        (doc id = lowercased email) with a `registrationIds` array field
-        listing the VPD IDs they're allowed to see. They're synced locally
-        the same way registrations/scores are, and land on a restricted
-        "My data" view scoped to just those IDs.
+      - Every other email lands on a restricted "My data" view scoped to the
+        registrations whose `adminEmail` field matches their login email.
 """
 
 from __future__ import annotations
@@ -76,7 +73,6 @@ DATA_DIR = Path(__file__).parent / "data_cache"
 DATA_DIR.mkdir(exist_ok=True)
 REGISTRATIONS_FILE = DATA_DIR / "registrations.json"
 SCORES_FILE = DATA_DIR / "scores.json"
-USERS_FILE = DATA_DIR / "users.json"
 META_FILE = DATA_DIR / "sync_metadata.json"
 
 FIRESTORE_IDENTITY_TOOLKIT_URL = (
@@ -165,28 +161,24 @@ def firebase_sign_in_with_password(email: str, password: str, api_key: str) -> t
     return False, msg
 
 
-def resolve_access(email: str) -> tuple[str, list[str]]:
+def resolve_access(email: str, reg_df: pd.DataFrame) -> tuple[str, list[str]]:
     """
     Determine what an authenticated email is allowed to see.
 
     Returns (role, registration_ids):
-      - ("admin", [])                 — full unrestricted dashboard
-      - ("user", [<VPD IDs>])         — restricted to those participants
-      - ("denied", [])                — no matching users-collection entry
+      - ("admin", [])          — full unrestricted dashboard
+      - ("user", [<VPD IDs>])  — restricted to registrations whose
+                                  `adminEmail` field matches this email
     """
     email = email.lower()
     if email in _admin_emails():
         return "admin", []
 
-    users = load_users_local(get_file_mtime(USERS_FILE))
-    rec = users.get(email)
-    if not rec:
-        return "denied", []
+    if reg_df.empty or "adminEmail" not in reg_df.columns or "registrationId" not in reg_df.columns:
+        return "user", []
 
-    ids = rec.get("registrationIds")
-    if not ids and rec.get("registrationId"):
-        ids = [rec["registrationId"]]
-    return "user", list(ids or [])
+    mask = reg_df["adminEmail"].astype(str).str.strip().str.lower() == email
+    return "user", reg_df.loc[mask, "registrationId"].dropna().tolist()
 
 
 def render_login() -> None:
@@ -241,15 +233,6 @@ def _fetch_all_registrations(db: firestore.Client) -> list[dict[str, Any]]:
     return rows
 
 
-def _fetch_all_users(db: firestore.Client) -> dict[str, dict]:
-    """Pull the `users` collection (email -> access record) as a plain dict."""
-    docs = db.collection("users").stream()
-    out: dict[str, dict] = {}
-    for doc in docs:
-        out[doc.id.lower()] = doc.to_dict() or {}
-    return out
-
-
 def _fetch_scores_for_vpd(db: firestore.Client, vpd_id: str) -> dict[str, dict]:
     """{date: {domain: {Level N: {score, timestamp}}}} for one VPD."""
     base = db.collection("scores").document(vpd_id)
@@ -300,20 +283,8 @@ def sync_from_firestore(db: firestore.Client) -> dict[str, Any]:
         encoding="utf-8",
     )
 
-    # --- Users (login access mapping) ------------------------------------ #
-    progress.progress(0.97, text="Fetching user access list…")
-    try:
-        users = _fetch_all_users(db)
-    except Exception as e:
-        st.warning(f"Could not read users collection: {e}")
-        users = {}
-
-    USERS_FILE.write_text(
-        json.dumps(users, indent=2, default=_json_default),
-        encoding="utf-8",
-    )
-
     # --- Metadata ------------------------------------------------------- #
+    progress.progress(0.97, text="Finalising…")
     sessions_count = sum(
         len(date_map) > 0
         for vpd_map in scores.values()
@@ -331,7 +302,6 @@ def sync_from_firestore(db: firestore.Client) -> dict[str, Any]:
         "scores_vpd_count": len(scores),
         "score_sessions_count": sessions_count,
         "score_docs_count": score_docs_count,
-        "users_count": len(users),
     }
     META_FILE.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -386,14 +356,6 @@ def load_scores_local(file_mtime: float) -> dict[str, dict]:
     if not SCORES_FILE.exists():
         return {}
     return json.loads(SCORES_FILE.read_text(encoding="utf-8"))
-
-
-@st.cache_data(show_spinner=False)
-def load_users_local(file_mtime: float) -> dict[str, dict]:
-    """Load the email -> access-record dict from the local JSON."""
-    if not USERS_FILE.exists():
-        return {}
-    return json.loads(USERS_FILE.read_text(encoding="utf-8"))
 
 
 @st.cache_data(show_spinner="Building score DataFrame…")
@@ -1229,8 +1191,7 @@ def admin_dashboard():
             f"**Last synced:** {_format_relative_time(synced_at_iso)}  \n"
             f"📋 {meta.get('registrations_count', 0)} registrations  \n"
             f"🎯 {meta.get('scores_vpd_count', 0)} participants with scores  \n"
-            f"📄 {meta.get('score_docs_count', 0)} score documents  \n"
-            f"👤 {meta.get('users_count', 0)} login-access entries"
+            f"📄 {meta.get('score_docs_count', 0)} score documents"
         )
     else:
         st.sidebar.warning("No local data yet. Click below to fetch from Firestore.")
@@ -1321,7 +1282,8 @@ def main():
         return
 
     email = st.session_state["auth_email"]
-    role, allowed_ids = resolve_access(email)
+    reg_df = load_registrations_local(get_file_mtime(REGISTRATIONS_FILE))
+    role, allowed_ids = resolve_access(email, reg_df)
 
     st.sidebar.title("DCVPA-C Dashboard")
     st.sidebar.caption(f"Signed in as **{email}**" + (" · admin" if role == "admin" else ""))
@@ -1329,11 +1291,6 @@ def main():
         del st.session_state["auth_email"]
         st.rerun()
     st.sidebar.markdown("---")
-
-    if role == "denied":
-        st.title("🧠 DCVPA-C Dashboard")
-        st.error(f"No dashboard access is configured for **{email}**. Contact an administrator.")
-        return
 
     if role == "admin":
         admin_dashboard()
